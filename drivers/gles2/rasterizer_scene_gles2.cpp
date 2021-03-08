@@ -2438,6 +2438,8 @@ void RasterizerSceneGLES2::_render_render_list(RenderList::Element **p_elements,
 	RasterizerStorageGLES2::Skeleton *prev_skeleton = nullptr;
 	RasterizerStorageGLES2::GeometryOwner *prev_owner = nullptr;
 
+	bool prev_octahedral_compression = false;
+
 	Transform view_transform_inverse = p_view_transform.inverse();
 	CameraMatrix projection_inverse = p_projection.inverse();
 
@@ -2687,6 +2689,12 @@ void RasterizerSceneGLES2::_render_render_list(RenderList::Element **p_elements,
 			storage->info.render.surface_switch_count++;
 		}
 
+		bool octahedral_compression = ((RasterizerStorageGLES2::Surface *)e->geometry)->format & VisualServer::ArrayFormat::ARRAY_FLAG_USE_OCTAHEDRAL_COMPRESSION;
+		if (octahedral_compression != prev_octahedral_compression) {
+			state.scene_shader.set_conditional(SceneShaderGLES2::ENABLE_OCTAHEDRAL_COMPRESSION, octahedral_compression);
+			rebind = true;
+		}
+
 		bool shader_rebind = false;
 		if (rebind || material != prev_material) {
 			storage->info.render.material_switch_count++;
@@ -2804,6 +2812,7 @@ void RasterizerSceneGLES2::_render_render_list(RenderList::Element **p_elements,
 		prev_material = material;
 		prev_skeleton = skeleton;
 		prev_instancing = instancing;
+		prev_octahedral_compression = octahedral_compression;
 		prev_light = light;
 		prev_refprobe_1 = refprobe_1;
 		prev_refprobe_2 = refprobe_2;
@@ -2812,6 +2821,7 @@ void RasterizerSceneGLES2::_render_render_list(RenderList::Element **p_elements,
 	}
 
 	_setup_light_type(nullptr, nullptr); //clear light stuff
+	state.scene_shader.set_conditional(SceneShaderGLES2::ENABLE_OCTAHEDRAL_COMPRESSION, false);
 	state.scene_shader.set_conditional(SceneShaderGLES2::USE_SKELETON, false);
 	state.scene_shader.set_conditional(SceneShaderGLES2::SHADELESS, false);
 	state.scene_shader.set_conditional(SceneShaderGLES2::BASE_PASS, false);
