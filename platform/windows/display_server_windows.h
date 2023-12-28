@@ -317,11 +317,14 @@ class DisplayServerWindows : public DisplayServer {
 	Vector<String> tablet_drivers;
 
 	enum {
+		KEYBOARDS_SUPPORTED_MAX = 8,
+		KEY_STATES_BUFFER_SIZE = 256*8, // 256 bits per keyboard
 		KEY_EVENT_BUFFER_SIZE = 512
 	};
 
 	struct KeyEvent {
 		WindowID window_id;
+		int device;
 		bool alt, shift, control, meta;
 		UINT uMsg;
 		WPARAM wParam;
@@ -332,6 +335,9 @@ class DisplayServerWindows : public DisplayServer {
 
 	KeyEvent key_event_buffer[KEY_EVENT_BUFFER_SIZE];
 	int key_event_pos;
+	int keyboard_key_state_list[KEYBOARDS_SUPPORTED_MAX];
+	int keyboard_count;
+	bool keyboard_key_state_data[KEY_STATES_BUFFER_SIZE];
 
 	bool old_invalid;
 	int old_x, old_y;
@@ -485,6 +491,7 @@ class DisplayServerWindows : public DisplayServer {
 
 	void _process_activate_event(WindowID p_window_id, WPARAM wParam, LPARAM lParam);
 	void _process_key_events();
+	void _update_keyboard_key_state_map();
 
 	static void _dispatch_input_events(const Ref<InputEvent> &p_event);
 	void _dispatch_input_event(const Ref<InputEvent> &p_event);

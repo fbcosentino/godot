@@ -272,6 +272,7 @@ class DisplayServerX11 : public DisplayServer {
 		HashMap<int, Vector2> pen_tilt_x_range;
 		HashMap<int, Vector2> pen_tilt_y_range;
 		HashMap<int, bool> pen_inverted_devices;
+		HashMap<int, bool> master_devices;
 		XIEventMask all_event_mask;
 		HashMap<int, Vector2> state;
 		double pressure;
@@ -282,7 +283,9 @@ class DisplayServerX11 : public DisplayServer {
 		Vector2 relative_motion;
 		Vector2 raw_pos;
 		Vector2 old_raw_pos;
+		double device_id;
 		::Time last_relative_time;
+		::Time last_button_time;
 	} xi;
 
 	bool _refresh_device_info();
@@ -296,7 +299,7 @@ class DisplayServerX11 : public DisplayServer {
 	MouseMode mouse_mode = MOUSE_MODE_VISIBLE;
 	Point2i center;
 
-	void _handle_key_event(WindowID p_window, XKeyEvent *p_event, LocalVector<XEvent> &p_events, uint32_t &p_event_index, bool p_echo = false);
+	void _handle_key_event(WindowID p_window, XKeyEvent *p_event, LocalVector<XEvent> &p_events, uint32_t &p_event_index, bool p_echo = false, double device_id = 0);
 
 	Atom _process_selection_request_target(Atom p_target, Window p_requestor, Atom p_property, Atom p_selection) const;
 	void _handle_selection_request_event(XSelectionRequestEvent *p_event) const;

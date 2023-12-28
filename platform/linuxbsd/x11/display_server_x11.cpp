@@ -191,7 +191,9 @@ bool DisplayServerX11::_refresh_device_info() {
 	xi.absolute_devices.clear();
 	xi.touch_devices.clear();
 	xi.pen_inverted_devices.clear();
+	xi.master_devices.clear();
 	xi.last_relative_time = 0;
+	xi.last_button_time = 0;
 
 	int dev_count;
 	XIDeviceInfo *info = XIQueryDevice(x11_display, XIAllDevices, &dev_count);
@@ -201,6 +203,9 @@ bool DisplayServerX11::_refresh_device_info() {
 		if (!dev->enabled) {
 			continue;
 		}
+
+		xi.master_devices[dev->deviceid] = (dev->use == XIMasterPointer || dev->use == XIMasterKeyboard);
+
 		if (!(dev->use == XISlavePointer || dev->use == XIFloatingSlave)) {
 			continue;
 		}
@@ -3347,7 +3352,7 @@ BitField<MouseButtonMask> DisplayServerX11::_get_mouse_button_state(MouseButton 
 	return last_button_state;
 }
 
-void DisplayServerX11::_handle_key_event(WindowID p_window, XKeyEvent *p_event, LocalVector<XEvent> &p_events, uint32_t &p_event_index, bool p_echo) {
+void DisplayServerX11::_handle_key_event(WindowID p_window, XKeyEvent *p_event, LocalVector<XEvent> &p_events, uint32_t &p_event_index, bool p_echo, double device_id) {
 	WindowData &wd = windows[p_window];
 	// X11 functions don't know what const is
 	XKeyEvent *xkeyevent = p_event;
@@ -3361,6 +3366,13 @@ void DisplayServerX11::_handle_key_event(WindowID p_window, XKeyEvent *p_event, 
 			return;
 		}
 	}
+
+	printf(" >>> _handle_key_event() state: ");
+	for (int i=31; i>=0; i--) {
+		printf("%d", (xkeyevent->state & (1 << i))? 1 : 0 );
+		if ((i % 4) == 0) printf(" ");
+	}
+	printf("\n");
 
 	// This code was pretty difficult to write.
 	// The docs stink and every toolkit seems to
@@ -3449,6 +3461,7 @@ void DisplayServerX11::_handle_key_event(WindowID p_window, XKeyEvent *p_event, 
 				_get_key_modifier_state(xkeyevent->state, k);
 
 				k->set_window_id(p_window);
+				k->set_device(device_id);
 				k->set_pressed(keypress);
 
 				k->set_keycode(keycode);
@@ -3520,6 +3533,7 @@ void DisplayServerX11::_handle_key_event(WindowID p_window, XKeyEvent *p_event, 
 					_get_key_modifier_state(xkeyevent->state, k);
 
 					k->set_window_id(p_window);
+					k->set_device(device_id);
 					k->set_pressed(keypress);
 
 					k->set_keycode(keycode);
@@ -3595,6 +3609,7 @@ void DisplayServerX11::_handle_key_event(WindowID p_window, XKeyEvent *p_event, 
 	Ref<InputEventKey> k;
 	k.instantiate();
 	k->set_window_id(p_window);
+	k->set_device(device_id);
 
 	_get_key_modifier_state(xkeyevent->state, k);
 
@@ -3605,38 +3620,42 @@ void DisplayServerX11::_handle_key_event(WindowID p_window, XKeyEvent *p_event, 
 	// To detect them, i compare to the next event in list and
 	// check that their difference in time is below a threshold.
 
-	if (xkeyevent->type != KeyPress) {
-		p_echo = false;
+	// When a device_id is provided, this event came from XInput2
+	// In that case, we can simply trust p_echo and skip below
+	if (device_id == 0) {
+		if (xkeyevent->type != KeyPress) {
+			p_echo = false;
 
-		// make sure there are events pending,
-		// so this call won't block.
-		if (p_event_index + 1 < p_events.size()) {
-			XEvent &peek_event = p_events[p_event_index + 1];
+			// make sure there are events pending,
+			// so this call won't block.
+			if (p_event_index + 1 < p_events.size()) {
+				XEvent &peek_event = p_events[p_event_index + 1];
 
-			// I'm using a threshold of 5 msecs,
-			// since sometimes there seems to be a little
-			// jitter. I'm still not convinced that all this approach
-			// is correct, but the xorg developers are
-			// not very helpful today.
+				// I'm using a threshold of 5 msecs,
+				// since sometimes there seems to be a little
+				// jitter. I'm still not convinced that all this approach
+				// is correct, but the xorg developers are
+				// not very helpful today.
 
-#define ABSDIFF(x, y) (((x) < (y)) ? ((y) - (x)) : ((x) - (y)))
-			::Time threshold = ABSDIFF(peek_event.xkey.time, xkeyevent->time);
-#undef ABSDIFF
-			if (peek_event.type == KeyPress && threshold < 5) {
-				KeySym rk;
-				XLookupString((XKeyEvent *)&peek_event, str, 256, &rk, nullptr);
-				if (rk == keysym_keycode) {
-					// Consume to next event.
-					++p_event_index;
-					_handle_key_event(p_window, (XKeyEvent *)&peek_event, p_events, p_event_index, true);
-					return; //ignore current, echo next
+	#define ABSDIFF(x, y) (((x) < (y)) ? ((y) - (x)) : ((x) - (y)))
+				::Time threshold = ABSDIFF(peek_event.xkey.time, xkeyevent->time);
+	#undef ABSDIFF
+				if (peek_event.type == KeyPress && threshold < 5) {
+					KeySym rk;
+					XLookupString((XKeyEvent *)&peek_event, str, 256, &rk, nullptr);
+					if (rk == keysym_keycode) {
+						// Consume to next event.
+						++p_event_index;
+						_handle_key_event(p_window, (XKeyEvent *)&peek_event, p_events, p_event_index, true);
+						return; //ignore current, echo next
+					}
 				}
+
+				// use the time from peek_event so it always works
 			}
 
-			// use the time from peek_event so it always works
+			// save the time to check for echo when keypress happens
 		}
-
-		// save the time to check for echo when keypress happens
 	}
 
 	/* Phase 7, send event to Window */
@@ -4311,6 +4330,188 @@ void DisplayServerX11::process_events() {
 					case XI_DeviceChanged: {
 						_refresh_device_info();
 					} break;
+					//case XI_KeyPress:
+					//case XI_KeyRelease:
+					case XI_RawKeyPress:
+					case XI_RawKeyRelease: {
+						if (ignore_events) {
+							break;
+						}
+						if (mouse_mode != MOUSE_MODE_CAPTURED) {
+							break;
+						}
+						// In XInput2 key events, the OS might send 2 calls
+						// for each event: one with deviceid set to the master
+						// device (keyboard cursor in this case), and one for the
+						/// physical device. We are only interested in the
+						// physical device, so we simply discard the master one.
+						// Experimentally this doesn't happen in raw version of events
+						if (event_data->evtype == XI_KeyPress || event_data->evtype == XI_KeyRelease) {
+							if (xi.master_devices[event_data->deviceid]) {
+								break;
+							}
+						}
+
+						bool is_press = (event_data->evtype == XI_KeyPress || event_data->evtype == XI_RawKeyPress);
+
+						// For compatibility reasons, we synthesize a KeyEvent
+						// based on this XIRawEvent, and provide it to the old method.
+						// All properties must be forwarded or XLookupString and friends
+						// will crash&burn
+						XEvent key_event;
+						key_event.xkey.type = is_press? KeyPress : KeyRelease;
+						key_event.xkey.serial = event_data->serial;
+						key_event.xkey.send_event = event_data->send_event;
+						key_event.xkey.display = event_data->display;
+						key_event.xkey.window = event_data->event;
+						key_event.xkey.root = event_data->root;
+						key_event.xkey.subwindow = event_data->child;
+						key_event.xkey.keycode = event_data->detail;
+						key_event.xkey.time = event_data->time;
+						key_event.xkey.state = event_data->mods.effective;
+						key_event.xkey.x = event_data->event_x;
+						key_event.xkey.y = event_data->event_y;
+						key_event.xkey.x_root = event_data->root_x;
+						key_event.xkey.y_root = event_data->root_y;
+						key_event.xkey.same_screen = 1;
+
+						last_timestamp = key_event.xkey.time;
+
+						bool is_repeat = (event_data->flags & XIKeyRepeat);
+
+#ifdef DISPLAY_SERVER_X11_DEBUG_LOGS_ENABLED
+						if (is_press) {
+							DEBUG_LOG_X11("[%u] RawKeyPress window=%lu (%u), keycode=%u, time=%lu \n", frame, key_event.xkey.window, window_id, key_event.xkey.keycode, key_event.xkey.time);
+						} else {
+							DEBUG_LOG_X11("[%u] RawKeyRelease window=%lu (%u), keycode=%u, time=%lu \n", frame, key_event.xkey.window, window_id, key_event.xkey.keycode, key_event.xkey.time);
+						}
+#endif
+
+						// key event is a little complex, so
+						// it will be handled in its own function.
+						_handle_key_event(window_id, &key_event.xkey, events, event_index, is_repeat, event_data->sourceid);
+
+					} break;
+					case XI_RawButtonPress:
+					case XI_RawButtonRelease: {
+						if (ime_window_event || ignore_events) {
+							break;
+						}
+						if (mouse_mode != MOUSE_MODE_CAPTURED) {
+							break;
+						}
+
+						XIRawEvent *raw_event = (XIRawEvent *)event_data;
+						if (raw_event->time == xi.last_button_time) {
+							break; // Flush duplicate
+						}
+
+						xi.last_button_time = raw_event->time;
+
+						// Regenerating xbutton data to maintain compatibility with
+						// other methods (like _get_key_modifier_state(),
+						// _get_mouse_button_state(), etc)
+						event.xbutton.state = event_data->mods.effective;
+						event.xbutton.button = event_data->detail;
+						event.xbutton.window = event_data->event;
+						event.xbutton.time = raw_event->time;
+
+						last_timestamp = event.xbutton.time;
+
+						// mouse_mode is always MOUSE_MODE_CAPTURED in this block
+						event.xbutton.x = last_mouse_pos.x;
+						event.xbutton.y = last_mouse_pos.y;
+
+						Ref<InputEventMouseButton> mb;
+						mb.instantiate();
+
+						mb->set_window_id(window_id);
+						mb->set_device(raw_event->sourceid);
+						_get_key_modifier_state(event.xbutton.state, mb);
+						mb->set_button_index((MouseButton)event.xbutton.button);
+						if (mb->get_button_index() == MouseButton::RIGHT) {
+							mb->set_button_index(MouseButton::MIDDLE);
+						} else if (mb->get_button_index() == MouseButton::MIDDLE) {
+							mb->set_button_index(MouseButton::RIGHT);
+						}
+						mb->set_button_mask(_get_mouse_button_state(mb->get_button_index(), (event_data->evtype == XI_RawButtonPress) ? ButtonPress : ButtonRelease));
+						mb->set_position(Vector2(event.xbutton.x, event.xbutton.y));
+						mb->set_global_position(mb->get_position());
+
+						mb->set_pressed((event_data->evtype == XI_RawButtonPress));
+
+						const WindowData &wd = windows[window_id];
+
+						if (event_data->evtype == XI_ButtonPress) {
+							DEBUG_LOG_X11("[%u] ButtonPress window=%lu (%u), button_index=%u \n", frame, event.xbutton.window, window_id, mb->get_button_index());
+
+							// Ensure window focus on click.
+							// RevertToPointerRoot is used to make sure we don't lose all focus in case
+							// a subwindow and its parent are both destroyed.
+							if (!wd.no_focus && !wd.is_popup) {
+								XSetInputFocus(x11_display, wd.x11_window, RevertToPointerRoot, CurrentTime);
+							}
+
+							uint64_t diff = OS::get_singleton()->get_ticks_usec() / 1000 - last_click_ms;
+
+							if (mb->get_button_index() == last_click_button_index) {
+								if (diff < 400 && Vector2(last_click_pos).distance_to(Vector2(event.xbutton.x, event.xbutton.y)) < 5) {
+									last_click_ms = 0;
+									last_click_pos = Point2i(-100, -100);
+									last_click_button_index = MouseButton::NONE;
+									mb->set_double_click(true);
+								}
+
+							} else if (mb->get_button_index() < MouseButton::WHEEL_UP || mb->get_button_index() > MouseButton::WHEEL_RIGHT) {
+								last_click_button_index = mb->get_button_index();
+							}
+
+							if (!mb->is_double_click()) {
+								last_click_ms += diff;
+								last_click_pos = Point2i(event.xbutton.x, event.xbutton.y);
+							}
+						} else {
+							DEBUG_LOG_X11("[%u] ButtonRelease window=%lu (%u), button_index=%u \n", frame, event.xbutton.window, window_id, mb->get_button_index());
+
+							WindowID window_id_other = INVALID_WINDOW_ID;
+							Window wd_other_x11_window;
+							if (wd.focused) {
+								// Handle cases where an unfocused popup is open that needs to receive button-up events.
+								WindowID popup_id = _get_focused_window_or_popup();
+								if (popup_id != INVALID_WINDOW_ID && popup_id != window_id) {
+									window_id_other = popup_id;
+									wd_other_x11_window = windows[popup_id].x11_window;
+								}
+							} else {
+								// Propagate the event to the focused window,
+								// because it's received only on the topmost window.
+								// Note: This is needed for drag & drop to work between windows,
+								// because the engine expects events to keep being processed
+								// on the same window dragging started.
+								for (const KeyValue<WindowID, WindowData> &E : windows) {
+									if (E.value.focused) {
+										if (E.key != window_id) {
+											window_id_other = E.key;
+											wd_other_x11_window = E.value.x11_window;
+										}
+										break;
+									}
+								}
+							}
+
+							if (window_id_other != INVALID_WINDOW_ID) {
+								int x, y;
+								Window child;
+								XTranslateCoordinates(x11_display, wd.x11_window, wd_other_x11_window, event.xbutton.x, event.xbutton.y, &x, &y, &child);
+
+								mb->set_window_id(window_id_other);
+								mb->set_position(Vector2(x, y));
+								mb->set_global_position(mb->get_position());
+							}
+						}
+
+						Input::get_singleton()->parse_input_event(mb);
+					} break;
 					case XI_RawMotion: {
 						if (ime_window_event || ignore_events) {
 							break;
@@ -4412,6 +4613,7 @@ void DisplayServerX11::process_events() {
 							xi.relative_motion.y = xi.raw_pos.y;
 						}
 
+						xi.device_id = device_id;
 						xi.last_relative_time = raw_event->time;
 					} break;
 #ifdef TOUCH_ENABLED
@@ -4687,6 +4889,9 @@ void DisplayServerX11::process_events() {
 				if (ime_window_event || ignore_events) {
 					break;
 				}
+				if (mouse_mode == MOUSE_MODE_CAPTURED) {
+					break;
+				}
 				/* exit in case of a mouse button press */
 				last_timestamp = event.xbutton.time;
 				if (mouse_mode == MOUSE_MODE_CAPTURED) {
@@ -4880,6 +5085,7 @@ void DisplayServerX11::process_events() {
 				mm.instantiate();
 
 				mm->set_window_id(window_id);
+				mm->set_device(xi.device_id);
 				if (xi.pressure_supported) {
 					mm->set_pressure(xi.pressure);
 				} else {
@@ -4936,6 +5142,10 @@ void DisplayServerX11::process_events() {
 				if (ignore_events) {
 					break;
 				}
+				if (mouse_mode == MOUSE_MODE_CAPTURED) {
+					break;
+				}
+
 #ifdef DISPLAY_SERVER_X11_DEBUG_LOGS_ENABLED
 				if (event.type == KeyPress) {
 					DEBUG_LOG_X11("[%u] KeyPress window=%lu (%u), keycode=%u, time=%lu \n", frame, event.xkey.window, window_id, event.xkey.keycode, event.xkey.time);
@@ -5500,7 +5710,6 @@ DisplayServerX11::WindowID DisplayServerX11::_create_window(WindowMode p_mode, V
 				XISetMask(all_event_mask.mask, XI_TouchOwnership);
 			}
 #endif
-
 			XISelectEvents(x11_display, wd.x11_window, &all_event_mask, 1);
 		}
 
@@ -6142,6 +6351,10 @@ DisplayServerX11::DisplayServerX11(const String &p_rendering_driver, WindowMode 
 		all_master_event_mask.mask = all_master_mask_data;
 		XISetMask(all_master_event_mask.mask, XI_DeviceChanged);
 		XISetMask(all_master_event_mask.mask, XI_RawMotion);
+		XISetMask(all_master_event_mask.mask, XI_RawButtonPress);
+		XISetMask(all_master_event_mask.mask, XI_RawButtonRelease);
+ 		XISetMask(all_master_event_mask.mask, XI_RawKeyPress);
+ 		XISetMask(all_master_event_mask.mask, XI_RawKeyRelease);
 		XISelectEvents(x11_display, DefaultRootWindow(x11_display), &all_master_event_mask, 1);
 	}
 

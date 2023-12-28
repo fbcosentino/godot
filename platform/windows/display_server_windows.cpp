@@ -165,20 +165,26 @@ DisplayServer::WindowID DisplayServerWindows::_get_focused_window_or_popup() con
 void DisplayServerWindows::_register_raw_input_devices(WindowID p_target_window) {
 	use_raw_input = true;
 
-	RAWINPUTDEVICE rid[1] = {};
+	RAWINPUTDEVICE rid[2] = {};
 	rid[0].usUsagePage = 0x01;
 	rid[0].usUsage = 0x02;
 	rid[0].dwFlags = 0;
+	
+	rid[1].usUsagePage = 0x01;
+	rid[1].usUsage = 0x06;
+	rid[1].dwFlags = 0;
 
 	if (p_target_window != INVALID_WINDOW_ID && windows.has(p_target_window)) {
 		// Follow the defined window
 		rid[0].hwndTarget = windows[p_target_window].hWnd;
+		rid[1].hwndTarget = windows[p_target_window].hWnd;
 	} else {
 		// Follow the keyboard focus
 		rid[0].hwndTarget = 0;
+		rid[1].hwndTarget = 0;
 	}
 
-	if (RegisterRawInputDevices(rid, 1, sizeof(rid[0])) == FALSE) {
+	if (RegisterRawInputDevices(rid, 2, sizeof(rid[0])) == FALSE) {
 		// Registration failed.
 		use_raw_input = false;
 	}
@@ -3123,35 +3129,16 @@ LRESULT DisplayServerWindows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 			}
 
 			RAWINPUT *raw = (RAWINPUT *)lpb;
+			int device_id = (int)((uint64_t)(raw->header.hDevice) & 0xffffffff);
 
 			if (raw->header.dwType == RIM_TYPEMOUSE) {
-				Ref<InputEventMouseMotion> mm;
-				mm.instantiate();
-
-				mm->set_window_id(window_id);
-				mm->set_ctrl_pressed(control_mem);
-				mm->set_shift_pressed(shift_mem);
-				mm->set_alt_pressed(alt_mem);
-
-				mm->set_pressure((raw->data.mouse.ulButtons & RI_MOUSE_LEFT_BUTTON_DOWN) ? 1.0f : 0.0f);
-
-				mm->set_button_mask(last_button_state);
-
-				Point2i c(windows[window_id].width / 2, windows[window_id].height / 2);
-
-				// Centering just so it works as before.
-				POINT pos = { (int)c.x, (int)c.y };
-				ClientToScreen(windows[window_id].hWnd, &pos);
-				SetCursorPos(pos.x, pos.y);
-
-				mm->set_position(c);
-				mm->set_global_position(c);
-				mm->set_velocity(Vector2(0, 0));
+				Vector2 rel_motion = Vector2();
+				Point2i mouse_position(windows[window_id].width / 2, windows[window_id].height / 2);
 
 				if (raw->data.mouse.usFlags == MOUSE_MOVE_RELATIVE) {
-					mm->set_relative(Vector2(raw->data.mouse.lLastX, raw->data.mouse.lLastY));
-
-				} else if (raw->data.mouse.usFlags == MOUSE_MOVE_ABSOLUTE) {
+					rel_motion = Vector2(raw->data.mouse.lLastX, raw->data.mouse.lLastY);
+				} 
+				else if (raw->data.mouse.usFlags == MOUSE_MOVE_ABSOLUTE) {
 					int nScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
 					int nScreenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 					int nScreenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -3167,13 +3154,260 @@ LRESULT DisplayServerWindows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 
 					ScreenToClient(hWnd, &coords);
 
-					mm->set_relative(Vector2(coords.x - old_x, coords.y - old_y));
+					rel_motion = Vector2(coords.x - old_x, coords.y - old_y);
 					old_x = coords.x;
 					old_y = coords.y;
 				}
 
-				if ((windows[window_id].window_has_focus || windows[window_id].is_popup) && mm->get_relative() != Vector2()) {
+				// Only instantiates an InputEventMouseMotion if we are
+				// actually going to use it
+				if ((rel_motion != Vector2()) && (windows[window_id].window_has_focus || windows[window_id].is_popup)) {
+					Ref<InputEventMouseMotion> mm;
+					mm.instantiate();
+
+					mm->set_device(device_id);
+					mm->set_window_id(window_id);
+					mm->set_ctrl_pressed(control_mem);
+					mm->set_shift_pressed(shift_mem);
+					mm->set_alt_pressed(alt_mem);	
+
+					mm->set_pressure((raw->data.mouse.ulButtons & RI_MOUSE_LEFT_BUTTON_DOWN) ? 1.0f : 0.0f);
+
+					mm->set_button_mask(last_button_state);
+
+					// Centering just so it works as before.
+					POINT pos = { (int)mouse_position.x, (int)mouse_position.y };
+					ClientToScreen(windows[window_id].hWnd, &pos);
+					SetCursorPos(pos.x, pos.y);
+
+					mm->set_position(mouse_position);
+					mm->set_global_position(mouse_position);
+					mm->set_velocity(Vector2(0, 0));
+
+					mm->set_relative(rel_motion);
+
 					Input::get_singleton()->parse_input_event(mm);
+				}
+
+				// If there is a button state change, this generates an InputEvent
+				if (raw->data.mouse.usButtonFlags > 0) {
+					// raw->data.mouse.usButtonFlags can contain more than
+					// one button in the same message, but we dispatch one
+					// InputEventMouseButton per button, so we check each
+					// bit separately
+					for (int bit_i=0; bit_i<12; bit_i++) {
+						short button_bit = (1 << bit_i);
+
+						if (raw->data.mouse.usButtonFlags & button_bit) { // This button has the flag set
+
+							Ref<InputEventMouseButton> mb;
+							mb.instantiate();
+							mb->set_window_id(window_id);
+							mb->set_device(device_id);
+
+							switch (button_bit) {
+								case RI_MOUSE_LEFT_BUTTON_DOWN: {
+									mb->set_pressed(true);
+									mb->set_button_index(MouseButton::LEFT);
+								} break;
+								case RI_MOUSE_LEFT_BUTTON_UP: {
+									mb->set_pressed(false);
+									mb->set_button_index(MouseButton::LEFT);
+								} break;
+								case RI_MOUSE_MIDDLE_BUTTON_DOWN: {
+									mb->set_pressed(true);
+									mb->set_button_index(MouseButton::MIDDLE);
+								} break;
+								case RI_MOUSE_MIDDLE_BUTTON_UP: {
+									mb->set_pressed(false);
+									mb->set_button_index(MouseButton::MIDDLE);
+								} break;
+								case RI_MOUSE_RIGHT_BUTTON_DOWN: {
+									mb->set_pressed(true);
+									mb->set_button_index(MouseButton::RIGHT);
+								} break;
+								case RI_MOUSE_RIGHT_BUTTON_UP: {
+									mb->set_pressed(false);
+									mb->set_button_index(MouseButton::RIGHT);
+								} break;
+								case RI_MOUSE_BUTTON_4_DOWN: {
+									mb->set_pressed(true);
+									mb->set_button_index(MouseButton::MB_XBUTTON1);
+								} break;
+								case RI_MOUSE_BUTTON_4_UP: {
+									mb->set_pressed(false);
+									mb->set_button_index(MouseButton::MB_XBUTTON1);
+								} break;
+								case RI_MOUSE_BUTTON_5_DOWN: {
+									mb->set_pressed(true);
+									mb->set_button_index(MouseButton::MB_XBUTTON2);
+								} break;
+								case RI_MOUSE_BUTTON_5_UP: {
+									mb->set_pressed(false);
+									mb->set_button_index(MouseButton::MB_XBUTTON2);
+								} break;
+								case RI_MOUSE_WHEEL: {
+									mb->set_pressed(true);
+									int motion = (short)raw->data.mouse.usButtonData;
+									if (!motion) {
+										continue;
+									}
+									if (motion > 0) {
+										mb->set_button_index(MouseButton::WHEEL_UP);
+									} else {
+										mb->set_button_index(MouseButton::WHEEL_DOWN);
+									}
+									mb->set_factor(fabs((double)motion / (double)WHEEL_DELTA));
+								} break;
+								case RI_MOUSE_HWHEEL: {
+									mb->set_pressed(true);
+									int motion = (short)raw->data.mouse.usButtonData;
+									if (!motion) {
+										continue;
+									}
+									if (motion < 0) {
+										mb->set_button_index(MouseButton::WHEEL_LEFT);
+									} else {
+										mb->set_button_index(MouseButton::WHEEL_RIGHT);
+									}
+									mb->set_factor(fabs((double)motion / (double)WHEEL_DELTA));
+								} break;
+							}
+
+							mb->set_ctrl_pressed((wParam & MK_CONTROL) != 0);
+							mb->set_shift_pressed((wParam & MK_SHIFT) != 0);
+							mb->set_alt_pressed(alt_mem);
+							if (mb->is_pressed()) {
+								last_button_state.set_flag(mouse_button_to_mask(mb->get_button_index()));
+							} else {
+								last_button_state.clear_flag(mouse_button_to_mask(mb->get_button_index()));
+							}
+							mb->set_button_mask(last_button_state);
+
+							mb->set_position(mouse_position);
+
+							if (button_bit != WM_MOUSEWHEEL && button_bit != WM_MOUSEHWHEEL) {
+								if (!mb->is_pressed()) {
+									if (--pressrc <= 0 || last_button_state.is_empty()) {
+										pressrc = 0;
+									}
+								}
+							} else {
+								// For reasons unknown to humanity, wheel comes in screen coordinates.
+								POINT coords;
+								coords.x = mb->get_position().x;
+								coords.y = mb->get_position().y;
+
+								ScreenToClient(hWnd, &coords);
+
+								mb->set_position(Vector2(coords.x, coords.y));
+							}
+
+							mb->set_global_position(mb->get_position());
+
+							Input::get_singleton()->parse_input_event(mb);
+							if (mb->is_pressed() && mb->get_button_index() >= MouseButton::WHEEL_UP && mb->get_button_index() <= MouseButton::WHEEL_RIGHT) {
+								// Send release for mouse wheel.
+								Ref<InputEventMouseButton> mbd = mb->duplicate();
+								mbd->set_window_id(window_id);
+								last_button_state.clear_flag(mouse_button_to_mask(mbd->get_button_index()));
+								mbd->set_button_mask(last_button_state);
+								mbd->set_pressed(false);
+								Input::get_singleton()->parse_input_event(mbd);
+							}
+						}
+					}
+				}
+			}
+			else if (raw->header.dwType == RIM_TYPEKEYBOARD) {
+				// raw->data.keyboard.VKey -> Equivalent of WM_KEYx's wParam
+				// raw->data.keyboard.MakeCode -> Equivalent of WM_KEYx's scan code in lParam
+
+				// If keyboard_count == 0 and yet a RIM_TYPEKEYBOARD was received,
+				// it means the keyboard list is not up-to-date
+				if (!keyboard_count) {
+					_update_keyboard_key_state_map();
+				}
+
+				UINT raw_uMsg = raw->data.keyboard.Message;
+				USHORT wParam = raw->data.keyboard.VKey;
+				USHORT scancode = raw->data.keyboard.MakeCode;
+				uint32_t lParam = ((uint32_t)scancode) << 16;
+
+				if (raw_uMsg == WM_SYSKEYDOWN) {
+					raw_uMsg = WM_KEYDOWN;
+				}
+				if (raw_uMsg == WM_SYSKEYUP) {
+					raw_uMsg = WM_KEYUP;
+				}
+
+				if (raw_uMsg == WM_KEYDOWN) {
+					lParam |= (1 << 31);
+				}
+
+				for (int keyboard_i=0; keyboard_i<keyboard_count; keyboard_i++) {
+					if (keyboard_key_state_list[keyboard_i] == device_id) { // Came from this keyboard_i
+						if (keyboard_key_state_data[256*keyboard_i + scancode]) {
+							lParam |= (1 << 30); // Is echo
+						}
+						keyboard_key_state_data[256*keyboard_i + scancode] = (raw_uMsg == WM_KEYDOWN);
+						break;
+					}
+				}
+
+				switch (raw_uMsg) {
+					case WM_SYSKEYUP:
+					case WM_KEYUP:
+					case WM_SYSKEYDOWN:
+					case WM_KEYDOWN: {
+						if (wParam == VK_SHIFT) {
+							shift_mem = (raw_uMsg == WM_KEYDOWN);
+						}
+						if (wParam == VK_CONTROL) {
+							control_mem = (raw_uMsg == WM_KEYDOWN);
+						}
+						if (wParam == VK_MENU) {
+							alt_mem = (raw_uMsg == WM_KEYDOWN);
+							if (raw->data.keyboard.Flags & RI_KEY_E0) {
+								lParam |= (1 << 24);
+								gr_mem = alt_mem;
+							}
+						}
+
+						if (windows[window_id].ime_suppress_next_keyup && (raw_uMsg == WM_KEYUP || raw_uMsg == WM_SYSKEYUP)) {
+							windows[window_id].ime_suppress_next_keyup = false;
+							break;
+						}
+						if (windows[window_id].ime_in_progress) {
+							break;
+						}
+
+						// When SetCapture is used, ALT+F4 hotkey is ignored by Windows, so handle it ourselves
+						if (wParam == VK_F4 && alt_mem && (raw_uMsg == WM_KEYDOWN || raw_uMsg == WM_SYSKEYDOWN)) {
+							_send_window_event(windows[window_id], WINDOW_EVENT_CLOSE_REQUEST);
+						}
+						[[fallthrough]];
+					}
+					case WM_CHAR: {
+						ERR_BREAK(key_event_pos >= KEY_EVENT_BUFFER_SIZE);
+
+						// Make sure we don't include modifiers for the modifier key itself.
+						KeyEvent ke;
+						ke.shift = (wParam != VK_SHIFT) ? shift_mem : false;
+						ke.alt = (!(wParam == VK_MENU && uMsg == WM_KEYDOWN)) ? alt_mem : false;
+						ke.control = (wParam != VK_CONTROL) ? control_mem : false;
+						ke.meta = meta_mem;
+						ke.uMsg = raw_uMsg;
+						ke.window_id = window_id;
+						ke.device = device_id;
+
+						ke.wParam = wParam;
+						ke.lParam = lParam;
+
+						key_event_buffer[key_event_pos++] = ke;
+
+					} break;
+
 				}
 			}
 			delete[] lpb;
@@ -3565,6 +3799,11 @@ LRESULT DisplayServerWindows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 		case WM_XBUTTONDBLCLK:
 		case WM_XBUTTONDOWN:
 		case WM_XBUTTONUP: {
+			if (mouse_mode == MOUSE_MODE_CAPTURED && use_raw_input &&
+				// Double click is still handled here regardless of mouse mode
+				uMsg != WM_LBUTTONDBLCLK && uMsg != WM_RBUTTONDBLCLK && uMsg != WM_MBUTTONDBLCLK && uMsg != WM_XBUTTONDBLCLK
+			) { break; }
+
 			Ref<InputEventMouseButton> mb;
 			mb.instantiate();
 			mb->set_window_id(window_id);
@@ -3854,6 +4093,10 @@ LRESULT DisplayServerWindows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 			[[fallthrough]];
 		}
 		case WM_CHAR: {
+			if (mouse_mode == MOUSE_MODE_CAPTURED && use_raw_input) {
+				break;
+			}
+
 			ERR_BREAK(key_event_pos >= KEY_EVENT_BUFFER_SIZE);
 
 			// Make sure we don't include modifiers for the modifier key itself.
@@ -3864,6 +4107,7 @@ LRESULT DisplayServerWindows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 			ke.meta = meta_mem;
 			ke.uMsg = uMsg;
 			ke.window_id = window_id;
+			ke.device = 0;
 
 			if (ke.uMsg == WM_SYSKEYDOWN) {
 				ke.uMsg = WM_KEYDOWN;
@@ -3875,7 +4119,6 @@ LRESULT DisplayServerWindows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 			ke.wParam = wParam;
 			ke.lParam = lParam;
 			key_event_buffer[key_event_pos++] = ke;
-
 		} break;
 		case WM_IME_COMPOSITION: {
 			CANDIDATEFORM cf;
@@ -3956,6 +4199,7 @@ LRESULT DisplayServerWindows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 		} break;
 		case WM_DEVICECHANGE: {
 			joypad->probe_joypads();
+			_update_keyboard_key_state_map();
 		} break;
 		case WM_DESTROY: {
 			Input::get_singleton()->flush_buffered_events();
@@ -4088,6 +4332,7 @@ void DisplayServerWindows::_process_key_events() {
 					}
 
 					k->set_window_id(ke.window_id);
+					k->set_device(ke.device);
 					if (keycode != Key::SHIFT) {
 						k->set_shift_pressed(ke.shift);
 					}
@@ -4121,6 +4366,7 @@ void DisplayServerWindows::_process_key_events() {
 				k.instantiate();
 
 				k->set_window_id(ke.window_id);
+				k->set_device(ke.device);
 				k->set_pressed(ke.uMsg == WM_KEYDOWN);
 
 				Key keycode = KeyMappingWindows::get_keysym(ke.wParam);
@@ -4193,6 +4439,81 @@ void DisplayServerWindows::_process_key_events() {
 	}
 
 	key_event_pos = 0;
+}
+
+void DisplayServerWindows::_update_keyboard_key_state_map() {
+	// This method is only called when new devices are attached or detached.
+	// It is preferrable to bring processing burden to here for the sake of
+	// a lightweight statically allocated buffer to be used in key events
+	// keys are accessed as keyboard_key_state_data[256*keyboard_index]
+	// Where keyboard_index is the index in keyboard_key_state_list
+	
+	UINT nDevices;
+	PRAWINPUTDEVICELIST pRawInputDeviceList = NULL;
+
+	if ((GetRawInputDeviceList(NULL, &nDevices, sizeof(RAWINPUTDEVICELIST)) == 0) && (nDevices > 0)) { 
+		if ((pRawInputDeviceList = (PRAWINPUTDEVICELIST) malloc(sizeof(RAWINPUTDEVICELIST) * nDevices)) != NULL) {
+			nDevices = GetRawInputDeviceList(pRawInputDeviceList, &nDevices, sizeof(RAWINPUTDEVICELIST));
+			if (nDevices != (UINT)-1) {
+				int old_keyboard_key_state_list[KEYBOARDS_SUPPORTED_MAX];
+				memcpy(old_keyboard_key_state_list, keyboard_key_state_list, sizeof(old_keyboard_key_state_list));
+				bool old_state_data[KEY_STATES_BUFFER_SIZE];
+				memcpy(old_state_data, keyboard_key_state_data, sizeof(old_state_data));
+				int old_keyboard_count = keyboard_count;
+
+				keyboard_count = 0;
+				for (UINT dev_i=0; dev_i < nDevices; dev_i++) {
+					if (keyboard_count >= KEYBOARDS_SUPPORTED_MAX) {
+						WARN_PRINT("Number of connected keyboards exceeds max. Ignoring further keyboards");
+						break;
+					}
+
+					if (pRawInputDeviceList[dev_i].dwType == RIM_TYPEKEYBOARD) {
+						keyboard_key_state_list[keyboard_count++] = (int)((uint64_t)(pRawInputDeviceList[dev_i].hDevice) & 0xffffffff);
+					}
+				}
+
+				// If the new device attached/removed is not a keyboard, old and new lists will be identical
+				// and nothing should be done
+				if (memcmp(keyboard_key_state_list, old_keyboard_key_state_list, sizeof(old_keyboard_key_state_list)) != 0) {
+
+					// Repopulate keyboard_key_state_data with new indices, transferring data if needed
+					for (int keyboard_i=0; keyboard_i<keyboard_count; keyboard_i++) {
+						int old_keyboard_i = -1;
+						for (int i=0; i<old_keyboard_count; i++) {
+							if (old_keyboard_key_state_list[i] == keyboard_key_state_list[keyboard_i]) {
+								old_keyboard_i = i;
+								break;
+							}
+						}
+						
+						if (old_keyboard_i > -1) {
+							// Transferring existing data
+							for (int buffer_i=0; buffer_i<256; buffer_i++) {
+								keyboard_key_state_data[256*keyboard_i + buffer_i] = old_state_data[256*old_keyboard_i + buffer_i];
+							}
+						}
+						else {
+							// Populating new data
+							for (int buffer_i=0; buffer_i<256; buffer_i++) {
+								keyboard_key_state_data[256*keyboard_i + buffer_i] = 0;
+							}
+						}
+					}
+				}
+			}
+			else {
+				ERR_PRINT("could not populate RawInputDeviceList");
+			}
+			free(pRawInputDeviceList);
+		}
+		else {
+			ERR_PRINT("could not allocate memory for RawInputDeviceList");
+		}
+	}
+	else {
+		keyboard_count = 0; // If no devices found, there is no need to track keys
+	}
 }
 
 void DisplayServerWindows::_update_tablet_ctx(const String &p_old_driver, const String &p_new_driver) {
